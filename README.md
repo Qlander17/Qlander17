@@ -15,7 +15,7 @@ A private, ongoing agentic operating system I build and run daily — Python, de
 
 ## Background
 
-Sixteen-plus years across real estate transaction coordination, sales, and investing; enterprise storage hardware and firmware/software validation; technical support; account management; and sales engineering and team leadership — now applied to building the AI automation that replaces the manual versions of that same work.
+Sixteen-plus years across enterprise storage hardware and firmware/software validation; technical support; account management; and sales engineering and team leadership; and real estate transaction coordination, sales, and investing; — now applied to building the AI automation that replaces the manual versions of that same work.
 
 ## Current Focus
 
