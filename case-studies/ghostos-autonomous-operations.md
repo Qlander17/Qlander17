@@ -1,198 +1,195 @@
-# GhostOS: A Governed, Autonomous AI Operations Case Study
+# GhostOS: Exit Code Zero Is Not Mission Success
 
-A real engineering case study of the parts of GhostOS — a private, local-first agentic operating
-system — that are genuinely interesting independent of the private business logic they support:
-running AI-driven work unattended, safely, for hours at a time, with no human in the loop, and
-recovering from the real failures that happen along the way.
+GhostOS marked an unattended mission `COMPLETE` after the agent reported that it could not finish. The Claude Code process had exited successfully. No crash. No escalation. The work had not been done.
 
-## The problem
+That incident is the engineering problem this case study is about. Autonomous orchestration needs typed mission outcomes, durable authorization state, and recovery semantics — not a subprocess wrapper that infers success from `ok=True`.
 
-An AI coding agent (Claude Code) can do real, substantial work — but by default it stops and asks a
-human before almost every consequential action. That's correct behavior for a supervised session,
-and wrong behavior for work meant to run overnight: a permission prompt with nobody watching just
-means the work silently stalls. The naive fix — `bypassPermissions`, skip all prompts — trades one
-failure mode for a much worse one: an unattended agent with no safety rails at all.
+The falsified assumption: **a clean process exit is a completed mission.**
 
-The real engineering problem: run genuinely unattended AI work for hours, without ever removing the
-safety boundary a human-supervised session has, and be honest — not silent — about every real
-failure mode that shows up along the way.
+This document covers the parts of GhostOS — a private, local-first agentic operating system — that are inspectable without exposing private business logic: unattended execution, permission posture, outcome classification, concurrency leases, and the failures that forced those mechanisms into existence.
 
-## Architecture
+---
 
-### The deterministic/AI boundary
+## The incident
 
-The Claude agent decides *what* to do; a separate, deterministic Python layer decides *whether it's
-allowed*. The agent never has a way to grant itself permission — every tool call passes through a
-permission profile the agent doesn't control. This is `dontAsk` mode plus a real, hand-written
-allow/deny list per profile (`overnight-safe`, `research-safe`, etc.), not the agent's own judgment
-about what's safe.
+An unattended pipeline mission needed public financial filings from a government API. The permitted fetch tool could not set the identification header the source requires, so every request was rejected. The agent refused to fabricate a result, ended on an open question, and the process exited cleanly. The launcher recorded `COMPLETE`.
 
-### The three-state permission model
+Root cause: `classify_terminal_status()` treated a successful subprocess exit plus an empty escalation list as completion. It did not read what the agent's final answer said, and it did not inspect Claude Code's structured `permission_denials`. Nothing had crashed, so nothing looked wrong.
 
-Every tool call resolves to exactly one of three states:
+A later mission produced the same false-`COMPLETE` through a different semantic failure. The agent wrote an in-scope plan, then stopped to ask whether to proceed — the right move for an interactive session, the wrong move for a launch that already constituted permission to execute in-scope work. Again: `ok=True`, zero escalations, no permission denial. The earlier `BLOCKED_EXTERNAL_ACCESS` detector could not see it, because no tool had been denied.
 
-- **AUTO-ALLOW** — an explicit, bounded allow-list entry (e.g. `Bash(python3 *)`, `Bash(git status*)`,
-  `WebFetch`). Runs immediately, no human involved.
-- **HARD-DENY** — out of scope for this profile, full stop. No escalation path, no workaround. Most
-  denials are this: an unattended mission that tries `curl` to an external host, or `git push`,
-  simply can't, by design.
-- **HUMAN-ESCALATE** — a real, narrow set of actions (currently: `git push`, `git commit`,
-  `gh repo create/delete`, `gh api`, `npm publish`, `pip`/`npm install`, `sudo`, `chmod`, `chown`) that
-  are legitimate but consequential enough to need a real decision. These don't vanish into a denial —
-  they become a durable, structured request in a database-backed queue, with a real justification,
-  expected benefit, and material risks recorded, and the mission continues (or reports honestly that
-  it's blocked) rather than hanging.
+Two different unfinished missions, one shared error: **control-plane success is not task success.**
 
-### Fail-closed by construction
+---
 
-The distinction that matters: a **hard-deny** and a **not-yet-decided escalation** are never treated
-the same. An escalation-worthy action that hasn't been approved yet is still blocked — "pending" is
-not "allowed." And an escalation is explicitly *not* an interactive dialog: it's written to durable
-storage and the process continues without waiting for an answer, so one blocked branch never stalls
-an entire multi-hour mission.
+## Typed outcomes, not process supervision
 
-### Mission architecture, resumability, and rate-limit recovery
+The launcher now maps a finished `claude -p` invocation onto an explicit terminal status before it returns control. The current set, from `tools/ghostos_mission.py`:
 
-A supervisor process (`ghostos_overnight.py`) wraps each real Claude Code invocation: launch, run,
-checkpoint, detect a rate limit if one occurs, persist state, wait, and resume the *same* Claude
-session (`--session-id`/`--resume`) rather than starting over — verified empirically to preserve real
-conversational continuity across the gap, not just restart cold. A mission that hits a real usage
-limit mid-task doesn't fail; it waits with a bounded, capped backoff and picks the same conversation
-back up once the limit resets.
+| Status | What produces it |
+|---|---|
+| `COMPLETE` | Process ok, no escalations, no hard-denied external-access attempt, and no unresolved plan-mode question |
+| `COMPLETE_WITH_ESCALATIONS` | Process ok, but one or more consequential actions were filed as durable operator requests (`chairman_escalation_requests`) rather than executed |
+| `WAITING_FOR_CHAIRMAN` | Process not ok, and at least one escalation was filed — the objective depends on a human decision |
+| `BLOCKED_EXTERNAL_ACCESS` | Process ok, no escalations, but Claude Code recorded a hard-denied attempt to reach a non-localhost network resource |
+| `BLOCKED_AWAITING_INPUT` | Structured `GHOSTOS_MISSION_OUTCOME: BLOCKED_AWAITING_INPUT` marker, or (fallback) an unresolved plan-mode question in the final text |
+| `FAILED_SAFE` | Process not ok, no escalation — error, crash, or timeout |
+| `INVARIANT_CONFLICT` | Mission text contradicts a hard operator invariant (`chairman_invariants`); the mission is never launched |
 
-### Durable, per-mission reporting
+The structured marker is checked first. The agent running under `overnight-safe` is instructed to end with exactly one of:
 
-Every mission gets its own directory (`reports/missions/<mission-id>/`) with append-only logs
-(`transcript.jsonl`, `stdout.log`, `stderr.log`), a real status snapshot, a checkpoint history, and a
-final report — durable and UI-independent, so a mission's real record survives past any one terminal
-window or chat session.
+```
+GHOSTOS_MISSION_OUTCOME: COMPLETE
+GHOSTOS_MISSION_OUTCOME: BLOCKED_AWAITING_INPUT: <one-line reason>
+```
 
-### Concurrency: resource leases, and a real foreground/background model
+A `COMPLETE` marker does not override a hard-denied external-access attempt. A mission that says it is done, but was blocked on a denied fetch, is still `BLOCKED_EXTERNAL_ACCESS`. If the model emits no marker, classification falls through to structured denials, then to a narrow textual fallback (`"want me to proceed"` and similar phrases, only when the final text also ends in a question mark). That fallback exists because the historical Article 3 transcript predates the marker and would otherwise still classify as `COMPLETE`.
 
-Once more than one unattended mission (or an unattended mission alongside a live foreground session)
-became routine, file-level collision became a real risk. A small, path-prefix lease primitive lets a
-mission declare which part of the filesystem it owns (a one-line marker in its own spec file); a
-second mission or session checking for a conflicting active lease fails closed *before* it starts,
-rather than racing the first mission's writes. Deliberately not a distributed lock manager — a
-real, small, reviewable table, not new infrastructure.
+Every terminal status also requires `reports/missions/<mission-id>/final-report.md` to exist before control returns. If the agent did not write one, the launcher synthesizes a labeled fallback from status, checkpoints, result text, and escalation IDs.
 
-This isn't just a design principle — it's the actual working pattern for how a human-driven
-foreground session and an unattended background mission share this codebase day to day. A real,
-in-use discipline: before touching a path an unattended mission might own, the foreground session
-checks the real, current lease table (not a cached assumption) and treats an active lease as
-read-only for that path until the mission finishes; once a mission completes and its lease releases,
-foreground work resumes freely there. Reading is always safe; writing waits.
+This is still a heuristic over a finished subprocess, not a mid-tool-call pause. `claude -p` is atomic. Resumption re-invokes the same Claude session id after a wait; it does not continue from the denied instruction.
 
-### Pre-authorized missions and structured outcomes
+---
 
-An unattended mission and a supervised interactive session don't actually need the same permission
-posture for *planning* — a real problem this system originally got wrong. A mission would correctly
-recognize a task needed a plan before implementation (following the same discipline an interactive
-session follows), write a real, specific plan, and then stop to ask "want me to proceed on this
-basis?" — exactly right for a human present to answer, and exactly wrong for an unattended run with
-nobody there. The fix: launching a mission under the unattended profile now carries its own explicit,
-injected authorization that launch itself already constitutes permission to move from plan into
-execution for in-scope work — without touching the separate, much narrower set of actions (a public
-push, an account mutation, external contact) that still always require a real, human-decided
-escalation regardless of execution mode.
+## Durable authorization is not an interactive prompt
 
-Closing that gap also needed a second, structural piece: a way for the launcher to actually tell the
-difference between "genuinely stuck, correctly asking a real question" and "just being appropriately
-cautious about something the launch itself already authorized." The mission is now asked to end with
-a small, structured, machine-readable outcome marker rather than leaving the launcher to guess from
-prose — checked first, before any older, fuzzier signal, with a narrow, deliberately conservative
-text-pattern fallback for a mission that doesn't emit the marker at all.
+The Claude agent decides *what* to do. A separate, deterministic layer decides *whether the named tool invocation is allowed*. The agent cannot add allow-list entries or switch profiles. What an allowed interpreter can do *inside* an auto-allowed `python3`/`node` call is a different boundary, taken up below.
 
-### Transient failure recovery, distinct from a real usage limit
+Unattended missions run `claude -p --permission-mode dontAsk` against a hand-written profile (`overnight-safe`, `research-safe`, `development-safe`, `development-checkpoint`). `bypassPermissions` / `--dangerously-skip-permissions` is not used. `dontAsk` has no prompt surface: unmatched calls are skipped, not approved.
 
-A rate limit (a real usage-window reset) and a transient server error (an overloaded backend that
-will very likely succeed on retry moments later) are different problems needing different handling,
-not one bucket. A real mission lost real, substantial completed work to exactly this conflation once:
-a transient server error on the very first call, before any actual work began, was treated the same
-as a hard failure and the mission gave up immediately rather than retrying — discarding a mission that
-would very likely have succeeded a few minutes later. The fix: a separate, explicit detector for this
-class of failure, with its own short, genuinely exponential backoff (distinct from a rate limit's
-own longer, clock-time-aware wait), so a transient hiccup gets a real, bounded number of quick retries
-before anything is given up on — and a real, added guarantee that any real work already durably
-checkpointed before a transient failure survives the retry, never silently discarded.
+Every denied or allowed call resolves to one of three states:
 
-## Real failures found and fixed (not invented, not idealized)
+- **AUTO-ALLOW** — an explicit allow-list entry. Runs immediately.
+- **HARD-DENY** — out of scope for the profile. No escalation path. `git reset`, `sudo`, `rm`, credential-path `Read`/`Edit`, non-localhost `curl` as a Bash command, and similar.
+- **HUMAN-ESCALATE** — denied by the profile, but listed in `ESCALATION_WORTHY_PATTERNS` (`git push`, `git commit`, `gh repo create/delete`, `gh api`, `npm publish`, `pip`/`npm install`, `sudo`, `chmod`, `chown`). The action does not run. A row is written to `chairman_escalation_requests` with justification, expected benefit, and material risks. Pending is not allowed. An escalation is not a dialog: the process continues, or reports that it is blocked, without waiting.
 
-**The permission-prompt problem.** The starting problem this whole architecture exists to solve:
-Claude Code defaults to asking a human before nearly every consequential action. Solved by building
-the `dontAsk`/profile-based system above — not by disabling safety, by making safety declarative and
-deterministic instead of interactive.
+A second, independent `--allowedTools` / `--disallowedTools` layer on the CLI mirrors each profile's settings file, so a settings-parse mistake is not the only matcher.
 
-**A virtualenv-launcher failure.** A production script crashed with `ModuleNotFoundError` when run
-from a fresh, non-activated shell — a dependency that was genuinely installed, just not on the
-interpreter actually being used. Root cause, found by direct reproduction: `.venv/bin/python3` on
-this machine is a *symlink* to the system Python, and the original venv-detection code compared
-*resolved* paths — which silently defeats Python's actual venv-activation mechanism (confirmed
-directly: `sys.prefix` differs depending on whether the *unresolved* symlink path or its resolved
-target is what actually gets executed). Fixed by checking `sys.prefix` and always executing the
-unresolved path. A regression test reproduces the exact symlink scenario so this can't silently come
-back.
+Launch under `overnight-safe` injects an additional authorization into the system prompt: producing a plan and then executing in-scope work is already authorized by the launch. That text cannot override HARD-DENY or HUMAN-ESCALATE. Those remain enforced by the tool profile.
 
-**A false-"COMPLETE" status bug.** A real unattended mission hit a hard external-access block (see
-below), correctly refused to fabricate a result, and ended by asking an open question — and the
-launcher recorded it as `COMPLETE` anyway. Root cause: the terminal-status classifier only checked
-whether the underlying process exited cleanly and whether any formal escalation had been filed —
-both looked "clean" here purely because nothing crashed, with zero awareness of what the agent's own
-final answer actually said. Fixed with a new, *structurally* detected status (reading Claude Code's
-own real permission-denial data, not string-matching the agent's prose) for exactly this case, plus a
-launcher-level guarantee that a real final report always exists before a mission returns control —
-previously, a report only existed if the agent itself remembered to write one.
+---
 
-**A real external-access blocker, root-caused rather than routed around.** A pipeline mission needed
-to fetch public financial filings from a government API that requires a compliant identification
-header; the tool available for external fetches inside the sandbox can't set custom headers, so every
-request was correctly rejected by the source server. Investigated against the API's own published
-access policy rather than assumed; fixed with a small, dependency-free HTTP client built specifically
-to satisfy that policy (proper identification, real rate limiting, retry/backoff) — invoked as a
-plain script rather than by loosening the sandbox's own access rules, which stayed exactly as
-restrictive as before.
+## Where enforcement actually happens — and where it does not
 
-**A filing-metadata bug, found by the system itself.** Once real external data started flowing
-through a pipeline, a subtler bug surfaced: a metadata field that looked like it reliably marked an
-annual figure did not — some values tagged as annual were quietly quarterly numbers, which would
-have silently corrupted every multi-year trend calculated downstream. Found by validating each
-record's own real date range instead of trusting its label, fixed with duration-based filtering, and
-locked in with a regression test.
+The safety claim that needs answering: **can an allowed Python interpreter reproduce behavior nominally denied by a provider command matcher?**
 
-**A second, different false-"COMPLETE" — a mission correctly stalling on a question nobody could
-answer.** A real, later mission correctly followed the interactive-session plan-first discipline: it
-wrote a real, specific, in-scope plan and ended by asking whether to proceed — precisely the pattern
-the pre-authorization fix above now closes at the source. But that fix landed *after* this mission
-ran, and at the time, an exit with no crash and no filed escalation looked "clean" by the same
-narrow definition the original false-COMPLETE bug used — a real, related, but genuinely distinct
-failure mode from the earlier external-access case (a real, satisfied plan-mode rule instead of a
-real permission denial). Root-caused, and the historical record corrected once understood, rather
-than left standing as an inaccurate "COMPLETE."
+### DISCOVERED LIMITATION
 
-**A transient server error mistaken for a hard failure.** A real mission's very first API call failed
-with a transient, server-side "overloaded" error — a condition explicitly usually temporary — and,
-because that failure class wasn't yet distinguished from a genuine hard failure, the mission gave up
-immediately rather than retrying, discarding a mission that had not yet done any real work but very
-likely would have succeeded moments later. Fixed with a dedicated detector for this specific failure
-class, separate from the real-usage-limit path (which needs a much longer, clock-aware wait, not a
-quick retry), and a real, tested guarantee that any work already durably checkpointed before a
-transient failure is never discarded by the retry that follows it.
+**Yes, in part — and that was observed, not hypothesized.** The outer enforcement boundary at discovery time was Claude Code's command-string matcher (`dontAsk` + profile allow/deny + the `--allowedTools`/`--disallowedTools` echo), plus post-hoc classification of whatever denials Claude records. It was not an OS sandbox, not a network namespace, not seccomp, and not `execution_guard`.
 
-## Test architecture
+`overnight-safe` auto-allows `Bash(python3 *)` and `Bash(node *)`. It denies `Bash(curl …)` except localhost GET, `Bash(wget *)`, `Bash(git push*)`, `Bash(rm *)`, and credential-path `Read`/`Edit`. The matcher sees the invocation string. It does not see what the interpreter does next.
 
-No mocked business logic standing in for real behavior where it matters: permission-denial handling
-is tested against real, previously-observed denial payloads, not synthetic guesses; the venv bug's
-regression test reproduces the actual symlink structure, not an approximation; the false-COMPLETE
-fix's regression tests are built directly from the real failed mission's own captured transcript.
-Real counts, not invented for this document: the core decision-engine test suite and the tooling test
-suite both run in the low thousands of tests combined, verified directly, not estimated.
+That is not a hypothetical hole. After WebFetch could not set the `User-Agent` SEC.gov requires, and non-localhost `curl` was denied, the repair was `company-intelligence-pipeline/services/sec_edgar_client.py`: a stdlib `urllib.request` client invoked as a Python script. The profile was not loosened. Python was already allowed. `tools/unattended_ghostos.py` even lists `"http.client"` and `"urllib.request"` among external-fetch patterns — but those patterns only fire if the Bash command was *denied*. An allowed `python3` command never reaches them.
 
-## What this deliberately does not claim
+The same matcher-vs-interpreter gap applied to:
 
-No performance/scale metrics are cited here because none have been measured against real external
-load — this is a single-operator system, not a claim of production scale. No implication that any of
-this runs without human oversight where it matters: every consequential action still resolves through
-the three-state model above, and a human still decides every escalation. This case study describes
-the governance and reliability architecture; it does not describe, and never will describe here, the
-private business logic (opportunity scoring, underwriting weights, CRM data) that architecture
-happens to run on top of.
+- `subprocess` from Python or Node invoking a binary whose *direct* Bash form is denied (`git push`, `curl`, `rm`)
+- filesystem reads of paths denied to the `Read` tool (`.env`, `secrets/`, `~/.ssh`) via `open()`, or via allowed `Bash(cat *)` / `Bash(grep *)`
+- nested `.env` / `credentials` files inside an otherwise-granted workspace tree
+- network POST or arbitrary sockets, which the curl deny-list never sees
+
+What the architecture already prevented, at the matcher layer:
+
+- the agent invoking those denied commands *as Bash tool calls*
+- unmatched tools running under `dontAsk` (fail closed: skip, do not approve)
+- `Read`/`Edit` of listed credential paths through those tools
+- HUMAN-ESCALATE actions executing without a durable queue row
+
+`execution_guard` is a different control plane. It gates GhostOS-native external writes and spend (`controller/scheduler/runner.py`, Etsy publish, paid pipeline) against a global write lock and a spend ceiling. It does not wrap Claude Bash. ADR-0003 scopes it that way on purpose.
+
+### THREAT MODEL
+
+The unattended worker is not a hostile remote tenant. It is a local provider CLI that the operator also uses interactively, running a mission file under `dontAsk`. The relevant adversary is **transitive capability**: an allowed interpreter reconstructing a denied named invocation.
+
+Two high-value reconstructions:
+
+1. **Network.** `Bash(python3 *)` is allowed. Direct non-localhost `curl` is not. Python `urllib.request`, `socket.create_connection`, `subprocess curl`, and Node `net.connect` all sit outside the matcher.
+2. **Secret files.** Landlock omit of `secrets/` and repo-root `.env` does not protect `pkg/deep/.env` if `pkg/` is granted `READ_FILE`. Landlock cannot subtract a filename pattern from an allowed tree.
+
+Host constraints (measured, not assumed): AppArmor `kernel.apparmor_restrict_unprivileged_userns=1` blocks unshare/bwrap netns; systemd `--user` has only `cpu memory pids` controllers, so `PrivateNetwork=` / `IPAddressDeny=` are accepted and then silently inert. Landlock ABI 8 is available, including TCP bind/connect by port. Ubuntu security is not weakened to make a prettier sandbox.
+
+### REMEDIATION
+
+Capability policy (`controller/engines/capability_policy.py`) now names four interpreter TCP modes: `none`, `localhost_only`, `public_read`, `external_write`. Enforcement (`controller/engines/execution_sandbox.py`) is outside the interpreter:
+
+- **Filesystem.** Recursive secret-free positive grants. Mixed directories are traverse-only; nested `.env`, `.env.*`, and `credentials` identities are omitted rather than denied after a parent grant. Landlock's inability to exclude by filename inside a granted tree is tested as a limitation, not papered over.
+- **Network.** The provider CLI is not Landlock-net-restricted (it must reach its API). PATH-invoked `python3` / `node` / `curl` / `wget` are re-exec'd through a shim that stacks a second Landlock net layer. `overnight-safe` defaults to `none`. Research/SEC missions request `public_read` explicitly (`--network-mode public_read` or profile `research-public-read`).
+- **Not used.** Deny-strings for `urllib` / `requests` / `socket`. bubblewrap. unprivileged netns. systemd IP filters. AppArmor changes.
+
+`PUBLIC_READ` is TCP connect to ports 80 and 443. It is not HTTP-method filtering. POST over those ports still succeeds.
+
+### REGRESSION TEST
+
+`controller/engines/test_capability_boundary.py` attacks the sandboxed interpreter, not the matcher, with synthetic fixtures:
+
+- Python direct HTTP (`urllib.request`) under `none` → blocked
+- Python TCP socket under `none` → blocked
+- Python `subprocess` curl under `none` → blocked
+- Node `net.connect` under `none` → blocked
+- Python `open` / `cat` / `grep` of nested `.env` → blocked
+- `public_read` still blocks high-port TCP and allows 443
+- Granting a parent tree with `READ_FILE` still leaks nested `.env` (Landlock limitation record)
+
+### RESIDUAL RISK
+
+- Absolute-path `/usr/bin/python3` spawned as the *first* exec from the unrestricted provider bypasses the PATH shim. Children of a PATH-invoked interpreter inherit the net layer.
+- Landlock net is TCP-only. UDP and raw sockets are not covered.
+- Landlock net is port-based, not IP-based. `localhost_only` is a local-service port class, not "destination 127.0.0.1".
+- `PUBLIC_READ` does not distinguish GET from POST.
+- Filename identities are not content inspection. A token in `config.yaml` is not omitted.
+- Codex remains unwrapped by GhostOS Landlock (its targeted AppArmor profile needs userns for bwrap). It uses `--sandbox read-only` instead.
+- The matcher layer is still present and still not a sandbox.
+
+The claim this architecture now earns is **not** "sandboxed unattended worker". It is command policy plus Landlock filesystem allow-listing plus PATH-interpreter TCP modes. See `docs/transitive-capability-model.md` and `reports/capability-boundary-p0-hardening.md`.
+
+---
+
+## Cooperative leases, not mutual exclusion
+
+Once an unattended mission and a foreground session shared the tree, path collision became a practical risk. `mission_workspace_leases` is a SQLite table of path-prefix claims. A mission declares a prefix in its spec; `ghostos_overnight.py` acquires it before launch and releases it on the way out. A conflicting active lease fails closed *before* the second mission starts.
+
+The module states its own limit: enforcement is by convention. Writers are expected to call `check_path_conflict()` first. There is no OS file lock, no PID liveness check, no automatic stale-lease reap, and no distributed lock manager. Acquire is check-then-insert across separate connections — a time-of-check/time-of-use race remains possible.
+
+This is single-host cooperative coordination among GhostOS writers. A non-cooperating process, a crash before release, or PID reuse is outside what the table can enforce.
+
+Foreground discipline: treat an active lease as write-deferred for that prefix until release. Concurrent reads of ordinary workspace files are permitted. They are not a transactionally consistent multi-file snapshot, and they are not a grant to read credential paths. Mission logs under `reports/missions/<id>/` are append-mode for `transcript.jsonl`, `stdout.log`, and `stderr.log`; `status.json` is overwritten. Append-only is a write convention, not an immutable filesystem attribute.
+
+---
+
+## Recovery that had to be split
+
+Rate-limit recovery and transient-server-error recovery were originally one bucket. A mission whose first API call failed with an overloaded-backend error was treated as a hard failure and abandoned, discarding work that a short retry would likely have finished.
+
+They are now separate detectors in `tools/ghostos_overnight.py`:
+
+- a usage-window rate limit waits with a clock-aware, capped backoff and resumes the same `--session-id`
+- a transient 5xx/overloaded error uses a short exponential backoff, distinct from the rate-limit wait
+- already-written checkpoints survive either retry
+
+Session resume preserves conversational continuity across the gap; it is still a new subprocess, not a paused instruction pointer.
+
+---
+
+## Incident table
+
+| Symptom | False assumption | Invariant introduced | Regression artifact | Residual risk |
+|---|---|---|---|---|
+| Mission exited 0; launcher wrote `COMPLETE`; agent had hit a denied external fetch and stopped on a question | Clean process exit + empty escalation list = finished work | Inspect Claude Code `permission_denials`; `BLOCKED_EXTERNAL_ACCESS` beats `ok=True` | `tools/test_ghostos_mission.py` (denial-payload classification) | A later-recovered denial can still flag the mission blocked — accepted, conservative |
+| Mission wrote a plan, asked “want me to proceed?”, exited 0, classified `COMPLETE` | Interactive plan-mode rules are safe to reuse unattended | Launch under `overnight-safe` authorizes in-scope execution; `GHOSTOS_MISSION_OUTCOME` marker; `BLOCKED_AWAITING_INPUT` | `test_unattended_ghostos.py` marker/fallback tests; historical Article 3 transcript as the fallback fixture | Marker is cooperative; a model that neither emits it nor matches the narrow phrase list can still look complete |
+| First-call overloaded error abandoned the mission | Rate-limit wait and transient 5xx are the same failure | Separate detectors; short exponential backoff for transient; checkpoints survive retry | overnight supervisor tests around `compute_transient_backoff_delay` | Classification depends on the provider's error shape remaining stable |
+| Fresh-shell launch crashed `ModuleNotFoundError` despite packages being installed | Resolved-path identity (`Path.resolve()`) identifies the venv interpreter | Compare `sys.prefix`; `exec` the unresolved `.venv/bin/python3` symlink | `tools/test_venv_bootstrap.py` (`test_symlinked_venv_python_is_never_resolved_before_exec`) | Any future bootstrap that resolves the symlink first will silently undo venv activation |
+| SEC EDGAR returned 403 to every permitted fetch | WebFetch is a general HTTP client | Policy-compliant stdlib client, invoked as allowed `python3`, without widening curl | `company-intelligence-pipeline/services/test_sec_edgar_client.py` | Historical exhibit of the interpreter gap. Later closed for PATH-invoked python3 by Landlock net mode `none`; SEC-style fetches now require explicit `public_read` |
+
+---
+
+## What this does not claim
+
+No performance or scale numbers. This is a single-operator, single-host system.
+
+No claim of a fully sandboxed unattended worker. Named-tool policy still bounds invocations, not every syscall. PATH-invoked python3/node/curl/wget under `none` cannot make outbound TCP; absolute-path first-exec from the provider, UDP, and HTTP POST on 80/443 under `public_read` remain residual. Nested `.env` identities are omitted from the Landlock allow-list; Landlock still cannot exclude a filename inside a granted tree.
+
+No claim that leases exclude arbitrary writers, that mission logs are tamper-evident, or that concurrent readers see a consistent snapshot.
+
+No claim that typed outcomes recover true agent intent. They recover structured signals and a conservative fallback. The private scoring, underwriting, and CRM logic this architecture happens to sit under is out of scope here.
+
+The tests that lock these behaviors live next to the modules named above. Counts change as the suites grow; the invariant is that permission-denial handling is tested against captured denial payloads, the venv bug against an actual symlink layout, and false-`COMPLETE` against the transcript shape that produced it.
