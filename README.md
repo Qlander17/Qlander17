@@ -25,4 +25,4 @@ Sixteen-plus years across enterprise storage hardware and firmware validation, t
 
 ## Current Focus
 
-Agentic AI, MCP, LangGraph, and business-workflow automation.
+Defensive autonomous systems, evidence-bound AI orchestration, Model Context Protocol (MCP), and deterministic workflow automation.
