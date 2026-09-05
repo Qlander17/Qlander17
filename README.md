@@ -4,16 +4,16 @@ I build defensive autonomous systems by pairing language models with determinist
 
 ## Selected Work
 
-**[Law Engine](https://github.com/Qlander17/law-engine)**
+**[Law Engine](https://github.com/isaac-dev-ai/law-engine)**
 A structured legal-intelligence and learning platform — cryptographic SHA-256 provenance-tracked statutory text (UCC Articles 1, 2, 3, and 9, Virginia enactment), a deterministic legal-reasoning engine, and an interactive TypeScript/Next.js/React study app with source-verified interactive scenarios. Public, Apache-2.0.
 
-**[Company Intelligence Pipeline](https://github.com/Qlander17/company-intelligence-pipeline)**
+**[Company Intelligence Pipeline](https://github.com/isaac-dev-ai/company-intelligence-pipeline)**
 A production-grade, end-to-end data-engineering pipeline — SEC EDGAR financial disclosures, cryptographic SHA-256 provenance, a normalized relational schema, automated data-quality validation, and advanced SQL analytics for 5 public companies. Public, Apache-2.0.
 
-**[Enterprise Agent Lab](https://github.com/Qlander17/enterprise-agent-lab)**
+**[Enterprise Agent Lab](https://github.com/isaac-dev-ai/enterprise-agent-lab)**
 An RFC-compliant MCP server plus two independent agent-orchestration implementations (plain Python and LangGraph) around the same deny-by-default, human-approval-gated workflow.
 
-**[AI-Native Content Operations Architecture & Reference Model](https://github.com/Qlander17/ai-native-content-operating-system)**
+**[AI-Native Content Operations Architecture & Reference Model](https://github.com/isaac-dev-ai/ai-native-content-operating-system)**
 A content-systems reference model — discovery, production, quality gates, distribution, and a checkable refresh-priority formula.
 
 **GhostOS**
