@@ -24,6 +24,8 @@ Two different unfinished missions, one shared error: **control-plane success is 
 
 ## Typed outcomes, not process supervision
 
+**The unit of autonomous-agent supervision is verified state transition, not process termination.**
+
 The launcher now maps a finished `claude -p` invocation onto an explicit terminal status before it returns control. The current set, from `tools/ghostos_mission.py`:
 
 | Status | What produces it |
@@ -70,6 +72,8 @@ Launch under `overnight-safe` injects an additional authorization into the syste
 ---
 
 ## Where enforcement actually happens — and where it does not
+
+**Agent permissions must be reasoned about as reachable capabilities, not merely allowed command names.**
 
 The safety claim that needs answering: **can an allowed Python interpreter reproduce behavior nominally denied by a provider command matcher?**
 
@@ -170,6 +174,22 @@ Session resume preserves conversational continuity across the gap; it is still a
 
 ---
 
+## Correct answers are not completion
+
+A later, separate governed pipeline extended the same launcher discipline to multi-model missions: a builder model produces work, an independent reviewer model evaluates it, and a set of deterministic checks verify the resulting artifacts before the mission can close. One real run made both models right and the mission still not done.
+
+The builder's analysis was complete and correct. The independent reviewer verified it in full and found the underlying judgment sound. Two required output files were fully authored — and staged at the wrong filesystem path, because a sandbox restriction blocked creating new files at the declared location. The reviewer's own verdict said so plainly, and still returned `REVISE`: the deterministic artifact-existence and hash checks had failed, and the arbitration is unconditional — a failed deterministic check overrides any reviewer verdict, regardless of how correct that verdict's own reasoning was. The mission ended `FAILED_SAFE`, exactly as designed.
+
+The falsified assumption here is a second-order version of the first one in this document: not "process exit implies success," but **correct judgment implies completion.** Neither a person's nor a model's assessment that work is right is itself the state a governed pipeline is contracted to produce. Completion requires the artifacts to exist, at the declared paths, matching the declared hashes — verified mechanically, not argued for.
+
+The same discipline applies one layer earlier. A separate incident: a reviewer call returned a genuine success response from the provider's own API — not a timeout, not an error — but the provider's own explicit answer field was empty. Evidence-binding refused to treat an empty result as a reviewable judgment and failed closed rather than let a downstream stage infer one. Transport success, model evaluation, a usable response, artifact production, and mission completion are five different states; a system that collapses any two of them will eventually report done on work that only reached the third.
+
+**What would falsify this:** a governed pipeline that let a reviewer's qualitative override commute a failed deterministic check — if "the reviewer says it's fine" were ever sufficient to close a mission over a failed artifact check, this principle would be wrong. It is not sufficient here, on purpose (`controller/engines/test_review_arbitration.py`).
+
+**The cost, stated plainly:** this trades recoverability for strictness. A mission whose substantive work is entirely done can sit terminated, pending a purely mechanical fix, rather than auto-resolving itself — a real, disclosed tradeoff, not a hidden one.
+
+---
+
 ## Incident table
 
 | Symptom | False assumption | Invariant introduced | Regression artifact | Residual risk |
@@ -179,6 +199,8 @@ Session resume preserves conversational continuity across the gap; it is still a
 | First-call overloaded error abandoned the mission | Rate-limit wait and transient 5xx are the same failure | Separate detectors; short exponential backoff for transient; checkpoints survive retry | overnight supervisor tests around `compute_transient_backoff_delay` | Classification depends on the provider's error shape remaining stable |
 | Fresh-shell launch crashed `ModuleNotFoundError` despite packages being installed | Resolved-path identity (`Path.resolve()`) identifies the venv interpreter | Compare `sys.prefix`; `exec` the unresolved `.venv/bin/python3` symlink | `tools/test_venv_bootstrap.py` (`test_symlinked_venv_python_is_never_resolved_before_exec`) | Any future bootstrap that resolves the symlink first will silently undo venv activation |
 | SEC EDGAR returned 403 to every permitted fetch | WebFetch is a general HTTP client | Policy-compliant stdlib client, invoked as allowed `python3`, without widening curl | `company-intelligence-pipeline/services/test_sec_edgar_client.py` | Historical exhibit of the interpreter gap. Later closed for PATH-invoked python3 by Landlock net mode `none`; SEC-style fetches now require explicit `public_read` |
+| SEC EDGAR 10-K filing metadata (`form`/`fp`) mislabels some quarterly figures as annual | Filing-metadata tags (`form='10-K'`, `fp='FY'`) reliably describe fact duration | Duration-based (not label-based) validation: filter on real `period_start`/`period_end` span (350–380 days) rather than trusting `fp`/`form` alone | `company-intelligence-pipeline/README.md`, `company-intelligence-pipeline/analytics/00_views.sql` | Cross-filing restatement reconciliation is still a separate, unimplemented concern |
+| A governed mission's builder and independent reviewer were both substantively correct, but two outputs were staged at the wrong path; the mission still ended `FAILED_SAFE` | A correct reviewer verdict is sufficient for completion | Deterministic artifact/hash checks arbitrate unconditionally over any reviewer verdict | `controller/engines/test_review_arbitration.py` | A fully correct mission can sit terminated pending a purely mechanical fix — accepted, disclosed |
 
 ---
 
